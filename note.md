@@ -1,30 +1,28 @@
-# HIP/AMDGPU offload 流程分析 + 自定义 opt 插入 — Handoff
+# HIP/AMDGPU offload 流程分析 + 自定义 opt 插入
 
-> 给下一个接手 agent 的上下文。目标：总结 clang 驱动下 HIP→AMDGPU 的编译+链接流程，以及"在 device link 前插入自定义 `opt`"的已敲定方案，便于继续实现。
+> 本文档梳理 clang 驱动下 HIP→AMDGPU 的编译+链接流程，并记录"在 device link 前插入自定义 `opt`"的方案。适用于较新的上游 llvm-project（clang 24 main 时代的新 offload 架构），无特定机器依赖。
 
-## 0. 背景与目标
+## 0. 背景与范围
 
-- 分析对象：**上游 llvm-project** 里，clang 驱动把 HIP 源码编译+链接成 AMDGPU 可执行文件的完整流程（host/device 分离、offload bundling/fat binary、amdgcn 代码对象、最终链接）。
-- 覆盖两条路径：默认（非 RDC）与 `-fgpu-rdc`。
-- 后续焦点（用户已确认）：在 **`constructLldCommand`** 里插入 `llvm-link → opt → lld`，让自定义 pass 跑在**所有 device bitcode 合并之后、`ld.lld` 之前**。
+- 对象：上游 llvm-project 里，clang 驱动把 HIP 源码编译+链接成 AMDGPU 可执行文件的完整流程。
+- 覆盖：默认（非 RDC）与 `-fgpu-rdc` 两条路径。
+- 范围：编译+链接（不含运行时执行）。
+- 结论性目标：在 `AMDGCN::Linker::constructLldCommand` 里插入 `llvm-link → opt → lld`，让自定义 pass 跑在**所有 device bitcode 合并之后、`ld.lld` 之前**。
 
-## 1. 环境（可复现）
+## 1. 前置条件
 
-| 项 | 值 |
-|---|---|
-| 仓库 | `/home/czc/workspace/llvm-project`（上游，commit `1e469c7`，分支 main） |
-| 构建 | `/home/czc/workspace/llvm-project/build/release`（clang `24.0.0git`，含 `clang-offload-bundler`/`llvm-offload-binary`/`clang-linker-wrapper`/`ld.lld`/`opt`/`llvm-link`） |
-| ROCm | `/home/czc/therock-tarball/install`（HIP 头 `include/hip`、device bitcode `amdgcn/bitcode`、`lib/libamdhip64.so`） |
-| GPU | **无**（无 `/dev/kfd`，`rocminfo` 探测不到）→ 只编译+链接，不执行 |
-| 示例 | `/tmp/hip-build-demo/vecadd.cpp`（`__global__ void k(int*)` + `hipMalloc`/`k<<<1,1>>>`），arch `gfx90a` |
+- 一份较新的上游 llvm-project 构建，产物含 `clang`、`clang-offload-bundler`、`llvm-offload-binary`、`clang-linker-wrapper`、`ld.lld`、`opt`、`llvm-link`。
+- 一份 ROCm 安装（`--rocm-path` 指向），提供：HIP 头（`include/hip`）、device bitcode（`amdgcn/bitcode`）、`libamdhip64.so`。
+- 示例 arch：`gfx90a`（换其它 arch 同理）。
 
-验证命令：
+验证命令（占位符）：
 ```bash
-CLANG=/home/czc/workspace/llvm-project/build/release/bin/clang++
-ROC=/home/czc/therock-tarball/install
-$CLANG -x hip --offload-arch=gfx90a --rocm-path=$ROC vecadd.cpp -o vecadd -v           # 默认
-$CLANG -x hip --offload-arch=gfx90a --rocm-path=$ROC -fgpu-rdc vecadd.cpp -o vecadd_rdc -v  # RDC
+CLANG=<llvm-build>/bin/clang++        # 或 PATH 里的 clang++
+ROC=<rocm-path>
+$CLANG -x hip --offload-arch=gfx90a --rocm-path=$ROC sample.cpp -o sample -v           # 默认
+$CLANG -x hip --offload-arch=gfx90a --rocm-path=$ROC -fgpu-rdc sample.cpp -o sample_rdc -v  # RDC
 ```
+`sample.cpp` 用最小 HIP 程序即可（`__global__ void k(int*)` + `hipMalloc` + `k<<<1,1>>>`）。
 
 ## 2. 关键结论：offload 流程（clang 24 main 新架构）
 
@@ -38,7 +36,7 @@ $CLANG -x hip --offload-arch=gfx90a --rocm-path=$ROC -fgpu-rdc vecadd.cpp -o vec
 5. `clang-linker-wrapper` → host `ld` + `libamdhip64.so`。
 
 ### `-fgpu-rdc` 路径
-1. device cc1：同上但 **无** `-amdgpu-internalize-symbols`，带 `-fgpu-rdc`。
+1. device cc1：同上但**无** `-amdgpu-internalize-symbols`，带 `-fgpu-rdc`。
 2. `llvm-offload-binary` 打包。
 3. host cc1：`-fembed-offload-object=<image>`（只嵌原始 image，不生成 fatbin）。
 4. `clang-linker-wrapper --wrapper-verbose` 展开：
@@ -81,7 +79,7 @@ LldArgs.push_back(OptBC);
 
 ### 外部 `.so`（`-load-pass-plugin`）结论
 - **可以**。`-load-pass-plugin` 就是给 out-of-tree `.so` 用的（`dlopen` + `llvmGetPassPluginInfo()` 注册进 `PassBuilder`，`-passes=` 按名实例化）。
-- 要求：`.so` 必须用**同一套 LLVM build** 编译（同 commit、同 `LLVM_ABI_BREAKING_CHECKS`/RTTI/异常配置）。用 CMake `add_llvm_pass_plugin(MyPass MyPass.cpp)`，`-DLLVM_DIR=/home/czc/workspace/llvm-project/build/release/lib/cmake/llvm`。
+- 要求：`.so` 必须用**同一套 LLVM build** 编译（同 commit、同 `LLVM_ABI_BREAKING_CHECKS`/RTTI/异常配置）。用 CMake `add_llvm_pass_plugin(MyPass MyPass.cpp)`，`-DLLVM_DIR=<llvm-build>/lib/cmake/llvm`。
 - 必须配 `-passes=my-pass`（或 `-passes=default<O3>,my-pass`）才会跑。
 - 顶层 `-mllvm` 会**同时进 host 编译**（host cc1 也会 `dlopen` 并跑 pass），所以 device-only 场景用 `constructLldCommand` 硬编码更干净。
 - 已实测 `-mllvm -time-passes` 确实透传到 `ld.lld` 命令行。
@@ -102,13 +100,9 @@ LldArgs.push_back(OptBC);
 | `clang/lib/Driver/OffloadBundler.cpp:69-123` | bundle magic / code-object id 解析 |
 | `clang/lib/CodeGen/CGCUDANV.cpp:897-1029` | `.hip_fatbin` 段、`HIPFatMagic`、`__hipRegisterFatBinary` |
 
-## 5. 下一步 / 未完成
+## 5. 下一步 / 待办
 
-1. 实现 `constructLldCommand` 的 `llvm-link → opt → lld` 修改，编译验证（`-v` 应看到 `llvm-link`/`opt`/`ld.lld` 三段）。
+1. 实现 `constructLldCommand` 的 `llvm-link → opt → lld` 修改，用 `-v` 验证应看到 `llvm-link`/`opt`/`ld.lld` 三段。
 2. 用 `add_llvm_pass_plugin` 编一个最小 `libcustompasses.so`，先走 `-mllvm -load-pass-plugin=` 快速验证 pass 逻辑。
 3. 决定 opt 的管线：`-passes=my-pass`（只跑你的）vs `-passes=default<O3>,my-pass`；以及 lld 是否重跑默认 LTO（可加 `-plugin-opt` 微调）。
 4. 语义提醒：非 RDC 时 `Inputs` 通常单 TU；RDC 时多 TU（本次目标场景）。
-
-## 6. Suggested skills（下一个 agent 建议调用）
-
-- **`grilling`**（mattpocock-skills）：若下一步还要在"pass 跑在合并模块的哪个位置 / opt 管线组合"等需求上继续对齐，用它逐轮澄清；否则实现部分是普通 LLVM 代码改动，无需特殊 skill。
